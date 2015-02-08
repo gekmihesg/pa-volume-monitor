@@ -1,0 +1,187 @@
+#!/usr/bin/env python2
+#
+# Copyright 2015 Markus Weippert <markus@gekmihesg.de>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+
+
+import sys
+import os
+import pynotify
+import dbus
+import dbus.mainloop.glib
+import gobject
+import re
+from ConfigParser import RawConfigParser as ConfigParser
+
+
+
+class PaVolumeSignalReceiver(object):
+    def __init__(self, conn):
+        self._conn = conn
+
+    def _signalCallback(self, data, signal, *args, **kwargs):
+        callback = "_signalCallback%s" %(signal)
+        if hasattr(self, callback):
+            callback = getattr(self, callback)
+            callback(data, *args, **kwargs)
+    
+    def _registerCallback(self, signalName=None, path=None, **kwargs):
+        self._conn.add_signal_receiver(self._signalCallback,
+            None, signalName, None, path, member_keyword="signal")
+    
+    def _unregisterCallback(self):
+        self._conn.remove_signal_receiver(self._signalCallback)
+
+
+
+class PaVolumeNotification(PaVolumeSignalReceiver):
+    def __init__(self, conn, path, icons, show=False):
+        super(self.__class__, self).__init__(conn);
+        
+        if not pynotify.is_initted():
+            pynotify.init("VolumeNotification")
+        self._icons = icons
+        notification = pynotify.Notification(" ")
+        notification.set_hint_string("synchronous", "volume")
+        self._notification = notification
+
+        device_obj = conn.get_object("org.PulseAudio.Core1.Device", path)
+        device = dbus.Interface(device_obj, "org.PulseAudio.Core1.Device")
+        self._muted = device_obj.Get("org.PulseAudio.Core1.Device", "Mute")
+        self._calcVolume(device_obj.Get("org.PulseAudio.Core1.Device", "Volume"))
+
+        self._registerCallback("org.PulseAudio.Core1.Device", path)
+        
+        if show:
+            notification.show()
+
+    def _calcVolume(self, volumes=None):
+        if volumes:
+            percent = min(100, sum(volumes) * 100 / len(volumes) / 65536)
+            self._lastVolume = percent
+        else:
+            percent = self._lastVolume
+        icon = 0 if self._muted else ((len(self._icons) - 1) * percent + 99) // 100
+        self._notification.update(" ", None, self._icons[icon])
+        self._notification.set_hint_int32("value", percent)
+
+    def _signalCallbackVolumeUpdated(self, volumes, *args, **kwargs):
+        self._calcVolume(volumes)
+        self._notification.show()
+
+    def _signalCallbackMuteUpdated(self, muted, *args, **kwargs):
+        self._muted = muted
+        self._calcVolume()
+        self._notification.show()
+        
+    def remove(self):
+        self._unregisterCallback()
+        self._notification.close()
+
+
+
+class PaVolumeMonitor(PaVolumeSignalReceiver):
+    def __init__(self, config):    
+        self._config = config
+        
+        sb = dbus.SessionBus()
+        pa_obj = sb.get_object("org.PulseAudio1", "/org/pulseaudio/server_lookup1")
+        addr = pa_obj.Get("org.PulseAudio.ServerLookup1", "Address")
+        sb.close()
+
+        conn = dbus.connection.Connection(addr, dbus.mainloop.glib.DBusGMainLoop())
+        super(self.__class__, self).__init__(conn);
+        
+        core_obj = self._conn.get_object("org.PulseAudio.Core1", "/org/pulseaudio/core1")
+        core = dbus.Interface(core_obj, "org.PulseAudio.Core1")
+        for signal in ["NewSink", "SinkRemoved", "NewSource", "SourceRemoved"]:
+            core.ListenForSignal("org.PulseAudio.Core1.%s" %(signal,), [])
+        self._core = core
+        
+        self._notifications = {}
+        
+        self._registerCallback("org.PulseAudio.Core1", "/org/pulseaudio/core1")
+        for path in core_obj.Get("org.PulseAudio.Core1", "Sinks") + \
+                core_obj.Get("org.PulseAudio.Core1", "Sources"):
+            self.addNotification(path)
+        
+        self._loop = gobject.MainLoop()
+        conn.call_on_disconnection(self._disconnect)
+    
+    def loop(self):
+        self._loop.run()
+    
+    def addNotification(self, path, show=False):
+        if not self._notifications.has_key(path):
+            device_obj = self._conn.get_object("org.PulseAudio.Core1.Device", path)
+            name = str(device_obj.Get("org.PulseAudio.Core1.Device", "Name"))
+            if not self._config.getboolean(name, "ignore"):
+                self._notifications[path] = \
+                    PaVolumeNotification(self._conn, path, \
+                            self._config.get(name, "icons").split(","), show)
+                self._subscribeToSignals()
+    
+    def removeNotification(self, path):
+        if self._notifications.has_key(path):
+            self._notifications.pop(path).remove()
+            self._subscribeToSignals()
+    
+    def _subscribeToSignals(self):
+        paths = self._notifications.keys()
+        for signal in ["VolumeUpdated", "MuteUpdated"]:
+            self._core.ListenForSignal("org.PulseAudio.Core1.Device.%s" %(signal), paths)
+    
+    def _disconnect(self, *args, **kwargs):
+        if self._loop.is_running():
+            self._loop.quit()
+    
+    def _signalCallbackNewSink(self, path, *args, **kwargs):
+        self.addNotification(path, True)
+    def _signalCallbackNewSource(self, path, *args, **kwargs):
+        self._signalCallbackNewSink(path, *args, **kwargs)
+    
+    def _signalCallbackSinkRemoved(self, path, *args, **kwargs):
+        self.removeNotification(path)
+    def _signalCallbackSourceRemoved(self, path, *args, **kwargs):
+        self._signalCallbackSinkRemoved(path, *args, **kwargs)
+
+
+
+class FuzzyConfigParser(ConfigParser):
+    def __init__(self, *args, **kwargs):
+        ConfigParser.__init__(self, *args, **kwargs)
+        self._patterns = {}
+        
+    def get(self, section, option):
+        for s in self.sections():
+            if not self._patterns.has_key(s):
+                regex = "^%s$" %(".*".join([re.escape(x) for x in s.split("*")]))
+                self._patterns[s] = re.compile(regex)
+            if self._patterns[s].match(section):
+                return ConfigParser.get(self, s, option)
+        return self.defaults()[option]
+
+
+
+if __name__ == "__main__":
+    config = FuzzyConfigParser({
+            "icons": "audio-volume-muted,audio-volume-low,audio-volume-medium,audio-volume-high",
+            "ignore": "false"
+        })
+    config.read(["/etc/pa-volume-monitor.cfg", os.path.expanduser("~/.pa-volume-monitor.cfg")])
+
+    vm = PaVolumeMonitor(config)
+    vm.loop()

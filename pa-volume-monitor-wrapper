@@ -1,0 +1,9 @@
+#!/bin/sh
+
+while :; do
+	pacmd list-modules 2>/dev/null |
+		grep -Fq "name: <module-dbus-protocol>" ||
+			pacmd load-module module-dbus-protocol >/dev/null 2>&1 &&
+			pa-volume-monitor
+	sleep 1
+done
